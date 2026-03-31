@@ -1,0 +1,15 @@
+[package]
+name = "pam_parallel_auth"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pamsm = { version = "0.5", features = ["libpam"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+libc = "0.2"
