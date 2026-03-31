@@ -1,3 +1,7 @@
+# Vibe-coded something for own use, use with caution
+
+---
+
 # pam_parallel_auth
 
 fprintd(지문)와 패스워드 인증을 **병렬로** 처리하는 PAM 모듈.
