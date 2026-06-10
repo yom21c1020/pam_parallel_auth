@@ -4,6 +4,7 @@ pub struct ModuleConfig {
     pub enable_closed_lid: bool,
     pub modules: Vec<String>,
     pub timeout_secs: u64,
+    pub max_tries: u32,
 }
 
 impl ModuleConfig {
@@ -13,6 +14,7 @@ impl ModuleConfig {
             enable_closed_lid: false,
             modules: vec!["fprint".to_string(), "pass".to_string()],
             timeout_secs: 60,
+            max_tries: 3,
         };
 
         for arg in args {
@@ -27,6 +29,14 @@ impl ModuleConfig {
                     let val = &arg["timeout=".len()..];
                     if let Ok(t) = val.parse::<u64>() {
                         config.timeout_secs = t;
+                    }
+                }
+                _ if arg.starts_with("max_tries=") => {
+                    let val = &arg["max_tries=".len()..];
+                    if let Ok(t) = val.parse::<u32>() {
+                        if t >= 1 {
+                            config.max_tries = t;
+                        }
                     }
                 }
                 _ => {}
