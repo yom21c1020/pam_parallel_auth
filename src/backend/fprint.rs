@@ -1,4 +1,4 @@
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 use zbus::message::Type as MessageType;
 use zbus::{Connection, MatchRule, MessageStream};
@@ -83,7 +83,7 @@ impl FprintBackend {
             connection,
             username: username.to_string(),
             debug: config.debug,
-            max_tries: config.max_tries.max(1),
+            max_tries: config.max_tries,
         })
     }
 
@@ -169,13 +169,13 @@ impl FprintBackend {
                                 let body = msg.body();
                                 if let Ok((result, done)) = body.deserialize::<(String, bool)>() {
                                     syslog_debug(self.debug, &format!("fprint: VerifyStatus signal: result={}, done={}", result, done));
-                                    match result.as_str() {
-                                        "verify-match" => {
+                                    match (result.as_str(), done) {
+                                        ("verify-match", true) => {
                                             self.stop_and_release().await;
                                             return AuthOutcome::Success { password: None };
                                         }
-                                        "verify-no-match" => {
-                                            tries_left -= 1;
+                                        ("verify-no-match", true) => {
+                                            tries_left = tries_left.saturating_sub(1);
                                             if tries_left == 0 {
                                                 syslog_debug(self.debug, "fprint: no match, max tries exhausted");
                                                 self.stop_and_release().await;
@@ -183,16 +183,20 @@ impl FprintBackend {
                                             }
                                             syslog_debug(self.debug, &format!("fprint: no match, retrying ({} tries left)", tries_left));
                                             self.verify_stop().await;
+                                            // Discard signals queued for the finished
+                                            // session (VerifyStop's reply arrives after
+                                            // them, so they are all local by now) so the
+                                            // next session doesn't misread them.
+                                            while let Some(Some(_)) = stream.next().now_or_never() {}
                                             break;
                                         }
-                                        "verify-retry-scan"
-                                        | "verify-swipe-too-short"
-                                        | "verify-finger-not-centered"
-                                        | "verify-remove-and-retry" => {
+                                        (_, false) => {
+                                            // Non-terminal status (retry-scan, swipe-too-short,
+                                            // ...): the session continues, keep waiting.
                                             continue;
                                         }
-                                        _ => {
-                                            syslog_debug(self.debug, &format!("fprint: unknown status '{}', treating as failure", result));
+                                        (status, true) => {
+                                            syslog_debug(self.debug, &format!("fprint: session ended with status '{}', treating as failure", status));
                                             self.stop_and_release().await;
                                             return AuthOutcome::Failed;
                                         }
@@ -219,6 +223,7 @@ impl FprintBackend {
     }
 
     async fn verify_stop(&self) {
+        syslog_debug(self.debug, "fprint: calling VerifyStop");
         let _ = self
             .connection
             .call_method(
@@ -232,12 +237,12 @@ impl FprintBackend {
     }
 
     async fn stop_and_release(&self) {
-        syslog_debug(self.debug, "fprint: stopping and releasing device");
         self.verify_stop().await;
         self.release().await;
     }
 
     async fn release(&self) {
+        syslog_debug(self.debug, "fprint: releasing device");
         let _ = self
             .connection
             .call_method(

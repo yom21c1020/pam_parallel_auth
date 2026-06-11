@@ -26,17 +26,16 @@ impl ModuleConfig {
                     config.modules = val.split(',').map(|s| s.trim().to_string()).collect();
                 }
                 _ if arg.starts_with("timeout=") => {
-                    let val = &arg["timeout=".len()..];
-                    if let Ok(t) = val.parse::<u64>() {
+                    if let Some(t) = parse_value(arg, "timeout=") {
                         config.timeout_secs = t;
                     }
                 }
                 _ if arg.starts_with("max_tries=") => {
-                    let val = &arg["max_tries=".len()..];
-                    if let Ok(t) = val.parse::<u32>() {
-                        if t >= 1 {
-                            config.max_tries = t;
-                        }
+                    // 0 is rejected: at least one verify attempt must run.
+                    if let Some(t) = parse_value::<u32>(arg, "max_tries=")
+                        && t >= 1
+                    {
+                        config.max_tries = t;
                     }
                 }
                 _ => {}
@@ -45,4 +44,9 @@ impl ModuleConfig {
 
         config
     }
+}
+
+/// Parse the numeric value of a `prefix=value` module argument.
+fn parse_value<T: std::str::FromStr>(arg: &str, prefix: &str) -> Option<T> {
+    arg.strip_prefix(prefix)?.parse().ok()
 }
