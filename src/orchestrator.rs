@@ -52,21 +52,13 @@ pub async fn run_auth(pamh: &Pam, config: &ModuleConfig) -> PamError {
         return PamError::AUTH_ERR;
     }
 
-    // Single backend: run directly
-    if backends.len() == 1 {
-        let backend = &backends[0];
-        debug_log!(pamh, config, "pam_parallel_auth: single backend mode ({})", backend.name());
-        let cancel = CancellationToken::new();
-        let outcome = backend.authenticate(cancel).await;
-        return handle_outcome(pamh, &outcome, config);
-    }
-
-    // Multiple backends: race them
-    debug_log!(pamh, config, "pam_parallel_auth: racing {} backends", backends.len());
+    // Race the backends (a single backend is just a race of one); this keeps
+    // timeout, cancellation, and cleanup handling on one code path.
+    debug_log!(pamh, config, "pam_parallel_auth: racing {} backend(s)", backends.len());
     race_backends(pamh, &backends, config).await
 }
 
-/// Race multiple backends using FuturesUnordered. First success wins.
+/// Race backends using FuturesUnordered. First success wins.
 async fn race_backends(
     pamh: &Pam,
     backends: &[Box<dyn AuthBackend>],
@@ -90,6 +82,7 @@ async fn race_backends(
     tokio::pin!(futures);
 
     let result = tokio::time::timeout(timeout_duration, async {
+        let mut any_failed = false;
         while let Some((idx, outcome)) = futures.next().await {
             let name = backends[idx].name();
             match &outcome {
@@ -102,14 +95,20 @@ async fn race_backends(
                 }
                 AuthOutcome::Failed => {
                     debug_log!(pamh, config, "pam_parallel_auth: {} failed", name);
+                    any_failed = true;
                 }
                 AuthOutcome::Unavailable(reason) => {
                     debug_log!(pamh, config, "pam_parallel_auth: {} unavailable: {}", name, reason);
                 }
             }
         }
-        debug_log!(pamh, config, "pam_parallel_auth: all backends failed");
-        PamError::AUTH_ERR
+        if any_failed {
+            debug_log!(pamh, config, "pam_parallel_auth: all backends failed");
+            PamError::AUTH_ERR
+        } else {
+            debug_log!(pamh, config, "pam_parallel_auth: no backend was available");
+            PamError::AUTHINFO_UNAVAIL
+        }
     })
     .await;
 

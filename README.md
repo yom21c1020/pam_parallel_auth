@@ -79,6 +79,7 @@ auth  required                    pam_deny.so
 | `debug` | off | syslog에 디버그 로그 출력 |
 | `enable_closed_lid` | off | 설정 시 덮개 닫힌 상태에서도 지문 인식 시도 |
 | `timeout=60` | `60` | 전체 인증 타임아웃 (초) |
+| `max_tries=3` | `3` | 지문 no-match 시 재시도 횟수 (장치 claim 유지한 채 VerifyStart 재호출) |
 
 ## 새 백엔드 추가
 

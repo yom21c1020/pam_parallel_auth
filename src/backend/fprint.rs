@@ -1,4 +1,4 @@
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 use zbus::message::Type as MessageType;
 use zbus::{Connection, MatchRule, MessageStream};
@@ -17,6 +17,7 @@ pub struct FprintBackend {
     connection: Connection,
     username: String,
     debug: bool,
+    max_tries: u32,
 }
 
 impl FprintBackend {
@@ -82,6 +83,7 @@ impl FprintBackend {
             connection,
             username: username.to_string(),
             debug: config.debug,
+            max_tries: config.max_tries,
         })
     }
 
@@ -128,73 +130,91 @@ impl FprintBackend {
         };
         syslog_debug(self.debug, "fprint: signal subscription ready");
 
-        // Start verification
-        syslog_debug(self.debug, "fprint: calling VerifyStart");
-        if let Err(e) = self
-            .connection
-            .call_method(
-                Some("net.reactivated.Fprint"),
-                &self.device_path,
-                Some("net.reactivated.Fprint.Device"),
-                "VerifyStart",
-                &("any",),
-            )
-            .await
-        {
-            syslog_debug(self.debug, &format!("fprint: VerifyStart failed: {e}"));
-            self.release().await;
-            return AuthOutcome::Failed;
-        }
-        syslog_debug(self.debug, "fprint: VerifyStart succeeded, waiting for finger...");
+        // Verify sessions: each VerifyStart..VerifyStop pair is one attempt.
+        // On no-match the session is done (done=true), so restart it with a
+        // fresh VerifyStart until max_tries attempts are exhausted. The device
+        // stays claimed across attempts.
+        let mut tries_left = self.max_tries;
 
-        // Wait for VerifyStatus signal or cancellation
         loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    syslog_debug(self.debug, "fprint: cancelled");
-                    self.stop_and_release().await;
-                    return AuthOutcome::Failed;
-                }
-                msg = stream.next() => {
-                    match msg {
-                        Some(Ok(msg)) => {
-                            let body = msg.body();
-                            if let Ok((result, done)) = body.deserialize::<(String, bool)>() {
-                                syslog_debug(self.debug, &format!("fprint: VerifyStatus signal: result={}, done={}", result, done));
-                                match result.as_str() {
-                                    "verify-match" => {
-                                        self.stop_and_release().await;
-                                        return AuthOutcome::Success { password: None };
+            syslog_debug(self.debug, "fprint: calling VerifyStart");
+            if let Err(e) = self
+                .connection
+                .call_method(
+                    Some("net.reactivated.Fprint"),
+                    &self.device_path,
+                    Some("net.reactivated.Fprint.Device"),
+                    "VerifyStart",
+                    &("any",),
+                )
+                .await
+            {
+                syslog_debug(self.debug, &format!("fprint: VerifyStart failed: {e}"));
+                self.release().await;
+                return AuthOutcome::Failed;
+            }
+            syslog_debug(self.debug, "fprint: VerifyStart succeeded, waiting for finger...");
+
+            // Wait for VerifyStatus signal or cancellation
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        syslog_debug(self.debug, "fprint: cancelled");
+                        self.stop_and_release().await;
+                        return AuthOutcome::Failed;
+                    }
+                    msg = stream.next() => {
+                        match msg {
+                            Some(Ok(msg)) => {
+                                let body = msg.body();
+                                if let Ok((result, done)) = body.deserialize::<(String, bool)>() {
+                                    syslog_debug(self.debug, &format!("fprint: VerifyStatus signal: result={}, done={}", result, done));
+                                    match (result.as_str(), done) {
+                                        ("verify-match", true) => {
+                                            self.stop_and_release().await;
+                                            return AuthOutcome::Success { password: None };
+                                        }
+                                        ("verify-no-match", true) => {
+                                            tries_left = tries_left.saturating_sub(1);
+                                            if tries_left == 0 {
+                                                syslog_debug(self.debug, "fprint: no match, max tries exhausted");
+                                                self.stop_and_release().await;
+                                                return AuthOutcome::Failed;
+                                            }
+                                            syslog_debug(self.debug, &format!("fprint: no match, retrying ({} tries left)", tries_left));
+                                            self.verify_stop().await;
+                                            // Discard signals queued for the finished
+                                            // session (VerifyStop's reply arrives after
+                                            // them, so they are all local by now) so the
+                                            // next session doesn't misread them.
+                                            while let Some(Some(_)) = stream.next().now_or_never() {}
+                                            break;
+                                        }
+                                        (_, false) => {
+                                            // Non-terminal status (retry-scan, swipe-too-short,
+                                            // ...): the session continues, keep waiting.
+                                            continue;
+                                        }
+                                        (status, true) => {
+                                            syslog_debug(self.debug, &format!("fprint: session ended with status '{}', treating as failure", status));
+                                            self.stop_and_release().await;
+                                            return AuthOutcome::Failed;
+                                        }
                                     }
-                                    "verify-no-match" => {
-                                        self.stop_and_release().await;
-                                        return AuthOutcome::Failed;
-                                    }
-                                    "verify-retry-scan"
-                                    | "verify-swipe-too-short"
-                                    | "verify-finger-not-centered"
-                                    | "verify-remove-and-retry" => {
-                                        continue;
-                                    }
-                                    _ => {
-                                        syslog_debug(self.debug, &format!("fprint: unknown status '{}', treating as failure", result));
-                                        self.stop_and_release().await;
-                                        return AuthOutcome::Failed;
-                                    }
+                                } else {
+                                    syslog_debug(self.debug, "fprint: failed to deserialize VerifyStatus body");
                                 }
-                            } else {
-                                syslog_debug(self.debug, "fprint: failed to deserialize VerifyStatus body");
                             }
-                        }
-                        Some(Err(e)) => {
-                            syslog_debug(self.debug, &format!("fprint: stream error: {e}"));
-                            self.stop_and_release().await;
-                            return AuthOutcome::Failed;
-                        }
-                        None => {
-                            syslog_debug(self.debug, "fprint: stream ended unexpectedly");
-                            self.stop_and_release().await;
-                            return AuthOutcome::Failed;
+                            Some(Err(e)) => {
+                                syslog_debug(self.debug, &format!("fprint: stream error: {e}"));
+                                self.stop_and_release().await;
+                                return AuthOutcome::Failed;
+                            }
+                            None => {
+                                syslog_debug(self.debug, "fprint: stream ended unexpectedly");
+                                self.stop_and_release().await;
+                                return AuthOutcome::Failed;
+                            }
                         }
                     }
                 }
@@ -202,8 +222,8 @@ impl FprintBackend {
         }
     }
 
-    async fn stop_and_release(&self) {
-        syslog_debug(self.debug, "fprint: stopping and releasing device");
+    async fn verify_stop(&self) {
+        syslog_debug(self.debug, "fprint: calling VerifyStop");
         let _ = self
             .connection
             .call_method(
@@ -214,10 +234,15 @@ impl FprintBackend {
                 &(),
             )
             .await;
+    }
+
+    async fn stop_and_release(&self) {
+        self.verify_stop().await;
         self.release().await;
     }
 
     async fn release(&self) {
+        syslog_debug(self.debug, "fprint: releasing device");
         let _ = self
             .connection
             .call_method(
